@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# bubble: run a command (default: interactive shell) in a sandbox that sees
+# only the network, the current directory (read-write) and a read-only
+# system (/usr, /etc). Works on the host and inside distrobox/toolbox.
+# Every invocation is an independent sandbox, so you can run it many times.
+#
+#   bubble                     # interactive shell
+#   bubble make test           # run a command
+#   bubble bash -c 'a | b'     # shell syntax
+#   BUBBLE_HOME=tmp bubble     # throwaway $HOME instead of the persistent one
+#   BUBBLE_DEBUG=1 bubble      # print the bwrap command line
+set -euo pipefail
+
+die() { echo "bubble: $*" >&2; exit 1; }
+command -v bwrap >/dev/null || die "bwrap not found, install the 'bubblewrap' package"
+
+work=$(pwd -P)
+home=$(realpath "$HOME")
+sandbox_home=${BUBBLE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/bubble/home}
+
+# Don't accidentally expose your whole home (or anything above it)
+[[ "$work" == "/" ]] && die "refusing to expose /"
+[[ "$work" == "$home" ]] && die "refusing to expose $work (its your home directory)"
+case "$home/" in
+  "$work"/*) die "refusing to expose $work (it contains your home directory)" ;;
+esac
+
+args=(
+  --die-with-parent
+  --unshare-all --share-net      # new user/pid/ipc/uts/cgroup ns, keep network
+  --hostname bubble
+  --clearenv
+  --ro-bind /usr /usr
+  --ro-bind /etc /etc
+  --dev /dev
+  --proc /proc
+  --tmpfs /tmp
+  --tmpfs /var/tmp
+  --tmpfs /run
+)
+
+# Merged-/usr symlinks (/bin -> usr/bin) vs. real dirs on older distros.
+# On Fedora Atomic /opt -> var/opt, so bind the real target too.
+for d in /bin /sbin /lib /lib32 /lib64 /libx32; do
+  [[ -e $d ]] || continue
+  if [[ -L $d ]]; then
+    args+=(--symlink "$(readlink "$d")" "$d")
+    real=$(realpath "$d")
+    [[ $real == /usr/* ]] || args+=(--ro-bind "$real" "$real")
+  else
+    args+=(--ro-bind "$d" "$d")
+  fi
+done
+
+# Fedora Atomic: /home -> var/home (only the symlink, not other users' homes)
+if [[ -L /home ]]; then
+  args+=(--symlink "$(readlink /home)" /home)
+fi
+
+# resolv.conf is often a symlink into /run (systemd-resolved, NetworkManager)
+if [[ -L /etc/resolv.conf ]]; then
+  r=$(realpath /etc/resolv.conf)
+  if [[ -e $r ]]; then args+=(--ro-bind "$r" "$r"); fi
+fi
+
+# Sandbox $HOME: persistent but separate from your real home, or tmpfs
+if [[ $sandbox_home == tmp ]]; then
+  args+=(--tmpfs "$home")
+else
+  mkdir -p "$sandbox_home"
+  args+=(--bind "$sandbox_home" "$home")
+fi
+
+# The one real directory the sandbox can write to
+args+=(--bind "$work" "$work" --chdir "$work")
+
+# Minimal environment
+args+=(
+  --setenv HOME "$HOME"
+  --setenv USER "${USER:-$(id -un)}"
+  --setenv LOGNAME "${USER:-$(id -un)}"
+  --setenv PATH "$PATH"
+  --setenv SHELL /bin/bash
+  --setenv BUBBLE 1
+)
+for v in TERM COLORTERM LANG LANGUAGE EDITOR VISUAL $(compgen -e | grep '^LC_' || true); do
+  if [[ -n ${!v:-} ]]; then args+=(--setenv "$v" "${!v}"); fi
+done
+
+# Block TIOCSTI terminal injection. Newer kernels already block it for
+# unprivileged processes; on older ones fall back to --new-session
+# (costs job control in interactive shells).
+if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || true) != 0 ]]; then
+  args+=(--new-session)
+fi
+
+if (($#)); then
+  cmd=("$@")
+else
+  # --rcfile replaces ~/.bashrc; our rcfile sources ~/.bashrc itself and
+  # sets PS1 last, so no distro or user bashrc can overwrite the prompt
+  cmd=(bash --rcfile /run/bubble.bashrc -i)
+fi
+
+args+=(--ro-bind-data 3 /run/bubble.bashrc)
+
+if [[ -n ${BUBBLE_DEBUG:-} ]]; then
+  printf '%q ' bwrap "${args[@]}" -- "${cmd[@]}" >&2; echo >&2
+fi
+
+exec bwrap "${args[@]}" -- "${cmd[@]}" 3<<'EOF'
+[ -f ~/.bashrc ] && . ~/.bashrc
+PS1='🫧[\u@bubble \W]\$ '
+EOF
