@@ -4,19 +4,46 @@
 # system (/usr, /etc). Works on the host and inside distrobox/toolbox.
 # Every invocation is an independent sandbox, so you can run it many times.
 #
-#   foam                     # interactive shell
+# Profiles: each profile has its own persistent $HOME, so tools in
+# different profiles can't read each other's configs or tokens.
+#   home:   ~/.local/share/foam/<profile>/home
+#   config: ~/.config/foam/<profile>.sh  (optional, sourced on the host)
+#
+# Usage: foam [-p PROFILE] [-t] [--] [COMMAND [ARGS...]]
+#   foam                     # interactive shell, profile "default"
 #   foam make test           # run a command
 #   foam bash -c 'a | b'     # shell syntax
-#   FOAM_HOME=tmp foam       # throwaway $HOME instead of the persistent one
+#   foam -p node npm install # run in profile "node"
+#   FOAM_PROFILE=node foam   # same as -p node
+#   foam -t                  # throwaway $HOME, nothing persists
 #   FOAM_DEBUG=1 foam        # print the bwrap command line
 set -euo pipefail
 
 die() { echo "foam: $*" >&2; exit 1; }
+usage() { sed -n '/^#!/d; /^#/!q; s/^# \{0,1\}//p' "$0"; }
+
+profile=${FOAM_PROFILE:-default}
+tmp_home=
+while getopts ':p:th' opt; do
+  case $opt in
+    p) profile=$OPTARG ;;
+    t) tmp_home=1 ;;
+    h) usage; exit 0 ;;
+    :) die "-$OPTARG needs an argument" ;;
+    *) die "unknown option -$OPTARG (try -h)" ;;
+  esac
+done
+shift "$((OPTIND - 1))"
+
+# No dots or slashes, so a profile name can't escape the data directory
+[[ $profile =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile name: $profile"
+
 command -v bwrap >/dev/null || die "bwrap not found, install the 'bubblewrap' package"
 
 work=$(pwd -P)
 home=$(realpath "$HOME")
-sandbox_home=${FOAM_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/foam/home}
+sandbox_home=${XDG_DATA_HOME:-$HOME/.local/share}/foam/$profile/home
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/foam/$profile.sh
 
 # Don't accidentally expose your whole home (or anything above it)
 [[ "$work" == "/" ]] && die "refusing to expose /"
@@ -63,18 +90,7 @@ if [[ -L /etc/resolv.conf ]]; then
   if [[ -e $r ]]; then args+=(--ro-bind "$r" "$r"); fi
 fi
 
-# Sandbox $HOME: persistent but separate from your real home, or tmpfs
-if [[ $sandbox_home == tmp ]]; then
-  args+=(--tmpfs "$home")
-else
-  mkdir -p "$sandbox_home"
-  args+=(--bind "$sandbox_home" "$home")
-fi
-
-# The one real directory the sandbox can write to
-args+=(--bind "$work" "$work" --chdir "$work")
-
-# Minimal environment
+# Minimal environment (before the profile config, so it can override)
 args+=(
   --setenv HOME "$HOME"
   --setenv USER "${USER:-$(id -un)}"
@@ -82,10 +98,31 @@ args+=(
   --setenv PATH "$PATH"
   --setenv SHELL /bin/bash
   --setenv FOAM 1
+  --setenv FOAM_PROFILE "$profile"
 )
 for v in TERM COLORTERM LANG LANGUAGE EDITOR VISUAL $(compgen -e | grep '^LC_' || true); do
   if [[ -n ${!v:-} ]]; then args+=(--setenv "$v" "${!v}"); fi
 done
+
+# Sandbox $HOME: one persistent home per profile, or a throwaway tmpfs
+if [[ -n $tmp_home ]]; then
+  args+=(--tmpfs "$home")
+else
+  mkdir -p "$sandbox_home"
+  args+=(--bind "$sandbox_home" "$home")
+fi
+
+# Per-profile extras (read-only binds, env, ...). This is trusted code run
+# on the host, so it must live somewhere no sandbox can write. Bind paths
+# under your home with "$home" (resolved path), not "$HOME".
+if [[ -f $conf ]]; then
+  # shellcheck source=/dev/null
+  source "$conf"
+fi
+
+# The one real directory the sandbox can write to (after the profile
+# config, so it wins over any read-only bind of a parent directory)
+args+=(--bind "$work" "$work" --chdir "$work")
 
 # Block TIOCSTI terminal injection. Newer kernels already block it for
 # unprivileged processes; on older ones fall back to --new-session
@@ -110,5 +147,6 @@ fi
 
 exec bwrap "${args[@]}" -- "${cmd[@]}" 3<<'EOF'
 [ -f ~/.bashrc ] && . ~/.bashrc
-PS1='🫧[\u@foam \W]\$ '
+shopt -s histappend
+PS1='🫧[\u@${FOAM_PROFILE} \W]\$ '
 EOF
