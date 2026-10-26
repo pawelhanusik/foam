@@ -1,0 +1,54 @@
+# bash completion for foam
+#
+# Install (loaded automatically by the bash-completion package):
+#   mkdir -p ~/.local/share/bash-completion/completions
+#   cp foam.bash-completion ~/.local/share/bash-completion/completions/foam
+
+_foam() {
+  local cur=${COMP_WORDS[COMP_CWORD]} cword=$COMP_CWORD
+  local data=${XDG_DATA_HOME:-$HOME/.local/share}/foam
+  local conf=${XDG_CONFIG_HOME:-$HOME/.config}/foam
+  local i=1 dashdash=
+
+  # Walk foam's own options to find where the sandboxed command starts
+  while ((i < cword)); do
+    case ${COMP_WORDS[i]} in
+      --) dashdash=1; ((i++)); break ;;
+      -p)
+        if ((i + 1 == cword)); then _foam_profiles; return; fi
+        ((i += 2)) ;;
+      -*) ((i++)) ;;
+      *) break ;;
+    esac
+  done
+
+  # Cursor is in the sandboxed command's arguments: complete file names.
+  # Deliberately not that command's own completion: it runs on the host
+  # and some read project files that the sandbox can change (e.g. make's
+  # completion evaluates $(shell ...) in the Makefile).
+  if ((i < cword)); then
+    compopt -o filenames 2>/dev/null
+    mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+    return
+  fi
+
+  # Cursor is at foam's options or the command name
+  if [[ -z $dashdash && $cur == -* ]]; then
+    mapfile -t COMPREPLY < <(compgen -W '-p -t -u -n -h --' -- "$cur")
+  else
+    mapfile -t COMPREPLY < <(compgen -c -- "$cur")
+  fi
+}
+
+# Profiles = existing profile homes plus profiles that only have a config
+_foam_profiles() {
+  local p names=()
+  for p in "$data"/*/ "$conf"/*.conf; do
+    [[ -e $p ]] || continue
+    p=${p%/}; p=${p##*/}
+    names+=("${p%.conf}")
+  done
+  mapfile -t COMPREPLY < <(compgen -W "${names[*]}" -- "$cur")
+}
+
+complete -F _foam foam

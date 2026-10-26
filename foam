@@ -1,152 +1,740 @@
 #!/usr/bin/env bash
-# foam: run a command (default: interactive shell) in a sandbox that sees
-# only the network, the current directory (read-write) and a read-only
-# system (/usr, /etc). Works on the host and inside distrobox/toolbox.
-# Every invocation is an independent sandbox, so you can run it many times.
+# foam: run a command (default: interactive shell) in a bubblewrap sandbox
+# that sees only:
+#   - the network
+#   - the current directory (read-write)
+#   - a read-only system (/usr, /etc)
+#   - its profile's own $HOME (~/.local/share/foam/<profile>/home)
+# Works on the host and inside distrobox/toolbox. In git repos,
+# the parts of .git that make host git run code are read-only (commits
+# still work).
 #
-# Profiles: each profile has its own persistent $HOME, so tools in
-# different profiles can't read each other's configs or tokens.
-#   home:   ~/.local/share/foam/<profile>/home
-#   config: ~/.config/foam/<profile>.sh  (optional, sourced on the host)
+# Usage: foam [-p PROFILE] [-t] [-u] [-n] [--] [COMMAND [ARGS...]]
+#   -p PROFILE  profile to use (default: "default")
+#   -t          throwaway $HOME instead of the profile's
+#   -u          update mode: paths marked 'protect' become writable
+#   -n          dry run: print the bwrap command instead of running it
 #
-# Usage: foam [-p PROFILE] [-t] [--] [COMMAND [ARGS...]]
-#   foam                     # interactive shell, profile "default"
-#   foam make test           # run a command
-#   foam bash -c 'a | b'     # shell syntax
-#   foam -p node npm install # run in profile "node"
-#   FOAM_PROFILE=node foam   # same as -p node
-#   foam -t                  # throwaway $HOME, nothing persists
-#   FOAM_DEBUG=1 foam        # print the bwrap command line
+# Profile config: ~/.config/foam/<profile>.conf (optional). One directive
+# per line, parsed but never executed. A leading ~ means your home.
+#   ro PATH         read-only bind of a real file/dir (skipped if missing)
+#   protect NAME    file/dir directly in the profile home stays read-only
+#                   (except with -u); must exist, create it once with -u
+#   path DIR        prepend DIR to PATH inside the sandbox
+#   env NAME=VALUE  set an environment variable inside the sandbox
+#   net yes|no|pasta  network: yes = share the host's (default), no = none,
+#                   pasta = own network through pasta (package: passt),
+#                   so localhost services and abstract sockets (e.g. X11)
+#                   stay out of reach
+#   seccomp yes|no  block syscalls that are risky and rarely needed: kernel
+#                   keyring, terminal injection, io_uring, odd socket types,
+#                   32-bit programs... (needs python3 and libseccomp)
+#   audit yes|no    after each run, report all changes: files (also
+#                   git-ignored ones and the profile home), commits, refs
+#
+# Examples:
+#   foam                     shell in the current directory
+#   foam -p node npm test    command in profile "node"
+#   foam bash -c 'a | b'     shell syntax inside the sandbox
+#   foam -n -p node          show exactly what the sandbox gets
 set -euo pipefail
 
-die() { echo "foam: $*" >&2; exit 1; }
-usage() { sed -n '/^#!/d; /^#/!q; s/^# \{0,1\}//p' "$0"; }
-
-profile=${FOAM_PROFILE:-default}
+# Options
+profile=default
 tmp_home=
-while getopts ':p:th' opt; do
-  case $opt in
-    p) profile=$OPTARG ;;
-    t) tmp_home=1 ;;
-    h) usage; exit 0 ;;
-    :) die "-$OPTARG needs an argument" ;;
-    *) die "unknown option -$OPTARG (try -h)" ;;
-  esac
-done
-shift "$((OPTIND - 1))"
+update=
+dry_run=
 
-# No dots or slashes, so a profile name can't escape the data directory
-[[ $profile =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile name: $profile"
+net=yes           # config: net yes|no|pasta
+seccomp=          # config: seccomp yes
+audit=            # config: audit yes
 
-command -v bwrap >/dev/null || die "bwrap not found, install the 'bubblewrap' package"
-
-work=$(pwd -P)
-home=$(realpath "$HOME")
-sandbox_home=${XDG_DATA_HOME:-$HOME/.local/share}/foam/$profile/home
-conf=${XDG_CONFIG_HOME:-$HOME/.config}/foam/$profile.sh
-
-# Don't accidentally expose your whole home (or anything above it)
-[[ "$work" == "/" ]] && die "refusing to expose /"
-[[ "$work" == "$home" ]] && die "refusing to expose $work (it's your home directory)"
-case "$home/" in
-  "$work"/*) die "refusing to expose $work (it contains your home directory)" ;;
-esac
-
-args=(
-  --die-with-parent
-  --unshare-all --share-net      # new user/pid/ipc/uts/cgroup ns, keep network
-  --hostname foam
-  --clearenv
-  --ro-bind /usr /usr
-  --ro-bind /etc /etc
-  --dev /dev
-  --proc /proc
-  --tmpfs /tmp
-  --tmpfs /var/tmp
-  --tmpfs /run
-)
-
-# Merged-/usr symlinks (/bin -> usr/bin) vs. real dirs on older distros.
-# On Fedora Atomic /opt -> var/opt, so bind the real target too.
-for d in /bin /sbin /lib /lib32 /lib64 /libx32; do
-  [[ -e $d ]] || continue
-  if [[ -L $d ]]; then
-    args+=(--symlink "$(readlink "$d")" "$d")
-    real=$(realpath "$d")
-    [[ $real == /usr/* ]] || args+=(--ro-bind "$real" "$real")
-  else
-    args+=(--ro-bind "$d" "$d")
-  fi
-done
-
-# Fedora Atomic: /home -> var/home (only the symlink, not other users' homes)
-if [[ -L /home ]]; then
-  args+=(--symlink "$(readlink /home)" /home)
-fi
-
-# resolv.conf is often a symlink into /run (systemd-resolved, NetworkManager)
-if [[ -L /etc/resolv.conf ]]; then
-  r=$(realpath /etc/resolv.conf)
-  if [[ -e $r ]]; then args+=(--ro-bind "$r" "$r"); fi
-fi
-
-# Minimal environment (before the profile config, so it can override)
-args+=(
-  --setenv HOME "$HOME"
-  --setenv USER "${USER:-$(id -un)}"
-  --setenv LOGNAME "${USER:-$(id -un)}"
-  --setenv PATH "$PATH"
-  --setenv SHELL /bin/bash
-  --setenv FOAM 1
-  --setenv FOAM_PROFILE "$profile"
-)
-for v in TERM COLORTERM LANG LANGUAGE EDITOR VISUAL $(compgen -e | grep '^LC_' || true); do
-  if [[ -n ${!v:-} ]]; then args+=(--setenv "$v" "${!v}"); fi
-done
-
-# Sandbox $HOME: one persistent home per profile, or a throwaway tmpfs
-if [[ -n $tmp_home ]]; then
-  args+=(--tmpfs "$home")
-else
-  mkdir -p "$sandbox_home"
-  args+=(--bind "$sandbox_home" "$home")
-fi
-
-# Per-profile extras (read-only binds, env, ...). This is trusted code run
-# on the host, so it must live somewhere no sandbox can write. Bind paths
-# under your home with "$home" (resolved path), not "$HOME".
-if [[ -f $conf ]]; then
-  # shellcheck source=/dev/null
-  source "$conf"
-fi
-
-# The one real directory the sandbox can write to (after the profile
-# config, so it wins over any read-only bind of a parent directory)
-args+=(--bind "$work" "$work" --chdir "$work")
-
-# Block TIOCSTI terminal injection. Newer kernels already block it for
-# unprivileged processes; on older ones fall back to --new-session
-# (costs job control in interactive shells).
-if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || true) != 0 ]]; then
-  args+=(--new-session)
-fi
-
-if (($#)); then
-  cmd=("$@")
-else
-  # --rcfile replaces ~/.bashrc; our rcfile sources ~/.bashrc itself and
-  # sets PS1 last, so no distro or user bashrc can overwrite the prompt
-  cmd=(bash --rcfile /run/foam.bashrc -i)
-fi
-
-args+=(--ro-bind-data 3 /run/foam.bashrc)
-
-if [[ -n ${FOAM_DEBUG:-} ]]; then
-  printf '%q ' bwrap "${args[@]}" -- "${cmd[@]}" >&2; echo >&2
-fi
-
-exec bwrap "${args[@]}" -- "${cmd[@]}" 3<<'EOF'
-[ -f ~/.bashrc ] && . ~/.bashrc
+# Interactive shell init, given to the sandbox as /run/foam.bashrc (a
+# read-only copy kept in foam's data dir).
+# --rcfile replaces ~/.bashrc; this sources it and sets PS1 last, so no
+# distro or user bashrc can overwrite the prompt.
+rcfile='[ -f ~/.bashrc ] && . ~/.bashrc
 shopt -s histappend
-PS1='🫧[\u@${FOAM_PROFILE} \W]\$ '
-EOF
+PS1="🫧[\u@${FOAM_PROFILE} \W]\\$ "'
+
+# Built up by the steps below
+args=()           # bwrap arguments
+sandbox_path=     # PATH inside the sandbox
+
+die() { echo "foam: $*" >&2; exit 1; }
+write_file() { # write $2 into file $1, creating it if needed, only if content differs
+  (( $# == 2 )) || { echo "usage: write_file FILE DATA" >&2; return 2; }
+  [[ -n $1 ]]   || { echo "write_file: empty filename" >&2; return 2; }
+  [[ -d $1 ]]   && { echo "write_file: '$1' is a directory" >&2; return 2; }
+
+  if [[ ! -f $1 || $(<"$1") != "$2" ]]; then
+    printf '%s\n' "$2" >"$1.$$" && mv -f -- "$1.$$" "$1"
+  fi
+}
+inside() { [[ $1/ == "$2"/* ]]; }                # $1 is $2 or below it
+overlaps() { inside "$1" "$2" || inside "$2" "$1"; }
+
+# --- 1. Options ---------------------------------------------------------------
+parse_options() {
+  local opt
+  while getopts ':p:tunh' opt; do
+    case $opt in
+      p) profile=$OPTARG ;;
+      t) tmp_home=1 ;;
+      u) update=1 ;;
+      n) dry_run=1 ;;
+      h) echo "usage: foam [-p PROFILE] [-t] [-u] [-n] [--] [COMMAND [ARGS...]]"
+         echo "details: comment at the top of $0"; exit 0 ;;
+      :) die "-$OPTARG needs an argument" ;;
+      *) die "unknown option -$OPTARG (try -h)" ;;
+    esac
+  done
+  # No dots or slashes, so a profile name can't point outside the data dir
+  [[ $profile =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile name: $profile"
+}
+
+# --- 2. Paths -----------------------------------------------------------------
+# All fully resolved, so comparisons can't be fooled by symlinks such as
+# Fedora Atomic's /home -> var/home.
+set_paths() {
+  work=$(pwd -P)
+  home=$(realpath "$HOME")
+  data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/foam
+  conf_dir=${XDG_CONFIG_HOME:-$HOME/.config}/foam
+  mkdir -p "$data_dir" "$conf_dir"
+  data_dir=$(realpath "$data_dir")
+  conf_dir=$(realpath "$conf_dir")
+  script_dir=$(dirname "$(realpath "$0")")
+  runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  sandbox_home=$data_dir/$profile/home
+  conf=$conf_dir/$profile.conf
+}
+
+# --- 3. Working directory checks ----------------------------------------------
+# The working directory is the only writable host path. Refuse places where
+# a sandbox could plant something that runs outside it later (dotfiles,
+# foam's configs, foam itself) or read other profiles' homes.
+check_workdir() {
+  local p parts found
+  [[ $work != / ]] || die "refusing to expose /"
+  if inside "$home" "$work"; then
+    die "refusing to expose $work (your home or a parent of it)"
+  fi
+  case $work/ in
+    "$home"/.*) die "refusing to expose $work (hidden directory in your home)" ;;
+  esac
+  for p in "$conf_dir" "$data_dir" "$script_dir" "$runtime_dir"; do
+    if overlaps "$work" "$p"; then die "refusing to expose $work (overlaps $p)"; fi
+  done
+
+  # System, runtime and temp dirs, or a parent of one: they hold devices and
+  # sockets of host services (systemd, D-Bus, podman, ssh-agent, tmux, X11)
+  for p in /dev /proc /sys /run /tmp /var/tmp; do
+    if inside "$p" "$work"; then die "refusing to expose $work (contains $p)"; fi
+  done
+
+  # Directories in your PATH: a command planted there runs on the host
+  IFS=: read -ra parts <<<"$PATH"
+  for p in "${parts[@]}"; do
+    [[ $p == /* ]] || continue
+    p=$(realpath -q -- "$p") || continue
+    if overlaps "$work" "$p"; then die "refusing to expose $work (overlaps $p from your PATH)"; fi
+  done
+
+  # Sockets and FIFOs near the top (.git aside): the sandbox could talk to
+  # whatever host process listens on them
+  found=$(cd "$work" && find . -maxdepth 3 -path ./.git -prune -o \( -type s -o -type p \) -print -quit 2>/dev/null)
+  [[ -z $found ]] || die "refusing to expose $work (contains socket/FIFO ${found#./})"
+}
+
+# --- 4. Base system -----------------------------------------------------------
+add_system() {
+  args+=(
+    --die-with-parent           # sandbox dies with foam
+    --unshare-all               # new namespaces (network shared: see main)
+    --hostname foam
+    --clearenv                  # environment is rebuilt in step 5
+    --ro-bind /usr /usr
+    --ro-bind /etc /etc
+    --dev /dev                  # minimal /dev, no hardware devices
+    --proc /proc                # shows only the sandbox's own processes
+    --tmpfs /tmp
+    --tmpfs /var/tmp
+    --tmpfs /run
+  )
+
+  # No nested user namespaces: they expose a lot of kernel code and are a
+  # common first step of kernel exploits (bwrap 0.8+)
+  if bwrap --help 2>&1 | grep -q -- --disable-userns; then
+    args+=(--unshare-user --disable-userns)
+  fi
+
+  # /bin, /lib, ... are symlinks into /usr on merged-/usr distros and real
+  # directories on older ones: mirror whatever this system has
+  local d
+  for d in /bin /sbin /lib /lib32 /lib64 /libx32; do
+    if [[ -L $d ]]; then
+      args+=(--symlink "$(readlink "$d")" "$d")
+    elif [[ -d $d ]]; then
+      args+=(--ro-bind "$d" "$d")
+    fi
+  done
+
+  # Fedora Atomic: /home -> var/home. Only the symlink, not its target,
+  # so other users' homes stay invisible.
+  if [[ -L /home ]]; then
+    args+=(--symlink "$(readlink /home)" /home)
+  fi
+
+  # resolv.conf is often a symlink into /run, which is empty in here
+  if [[ -L /etc/resolv.conf ]]; then
+    local r
+    r=$(realpath /etc/resolv.conf)
+    if [[ -e $r ]]; then args+=(--ro-bind "$r" "$r"); fi
+  fi
+}
+
+# --- 5. Environment -----------------------------------------------------------
+add_environment() {
+  local user=${USER:-$(id -un)} v p parts
+  args+=(
+    --setenv HOME "$HOME"
+    --setenv USER "$user"
+    --setenv LOGNAME "$user"
+    --setenv SHELL /bin/bash
+    --setenv FOAM_PROFILE "$profile"
+  )
+
+  # Terminal, locale and editor settings, if set
+  for v in TERM COLORTERM LANG LANGUAGE EDITOR VISUAL $(compgen -e | grep '^LC_' || true); do
+    if [[ -n ${!v:-} ]]; then args+=(--setenv "$v" "${!v}"); fi
+  done
+
+  # PATH without empty/relative entries and entries in your home: in here
+  # those would point into the writable profile home, where a tool could
+  # plant fake commands. Config 'path' lines are added in step 7.
+  IFS=: read -ra parts <<<"$PATH"
+  for p in "${parts[@]}"; do
+    case $p in
+      "" | [!/]* | "$HOME" | "$HOME"/* | "$home" | "$home"/*) continue ;;
+    esac
+    sandbox_path+=${sandbox_path:+:}$p
+  done
+}
+
+# --- 6. Home ------------------------------------------------------------------
+add_home() {
+  if [[ -n $tmp_home ]]; then
+    args+=(--tmpfs "$home")
+  else
+    mkdir -p "$sandbox_home"
+    args+=(--bind "$sandbox_home" "$home")
+  fi
+}
+
+# --- 7. Profile config --------------------------------------------------------
+# Parsed line by line, never executed: even a tampered config can only use
+# these directives, and each one validates its value.
+expand_tilde() {
+  case $1 in
+    "~") printf '%s\n' "$home" ;;
+    "~/"*) printf '%s\n' "$home/${1:2}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+yes_no() {
+  case $1 in
+    yes) echo 1 ;;
+    no) echo ;;
+    *) return 1 ;;
+  esac
+}
+
+load_config() {
+  [[ -f $conf ]] || return 0
+  local line key value p q real n=0 extra_path=()
+  bad() { die "$conf:$n: $*"; }
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    read -r key value <<<"$line"
+    [[ -n ${value:-} ]] || bad "'$key' needs a value"
+
+    case $key in
+      ro)
+        p=$(expand_tilde "$value")
+        [[ $p == /* && /$p/ != */../* ]] || bad "ro needs an absolute path or ~/..., without '..'"
+        # Read-only doesn't stop connecting to a socket or writing to a
+        # FIFO: refuse places full of them and anything containing one.
+        # A symlink's target is checked too.
+        real=$(realpath -q -- "$p" || true)
+        for q in "$data_dir" "$conf_dir" "$runtime_dir" /dev /proc /sys /run /tmp /var/tmp; do
+          if overlaps "$p" "$q" || { [[ -n $real ]] && overlaps "$real" "$q"; }; then
+            bad "ro can't expose $q"
+          fi
+        done
+        if [[ -n $real && -n $(find "$real" \( -type s -o -type p \) -print -quit 2>/dev/null) ]]; then
+          bad "ro can't expose $p (contains a socket or FIFO)"
+        fi
+        args+=(--ro-bind-try "$p" "$p")
+        ;;
+      protect)
+        # Only names directly in the profile home: a mount point can't be
+        # renamed or deleted from inside, but a parent directory could be
+        # swapped for one with different content.
+        [[ $value =~ ^[^/]+$ && $value != . && $value != .. ]] || bad "protect needs a name directly in the profile home (no '/')"
+        # With -u (or -t) no extra mount: the path stays part of the
+        # writable profile home.
+        [[ -z $update && -z $tmp_home ]] || continue
+        # Must already exist: otherwise a tool could create it and its
+        # content would be what gets protected from then on.
+        [[ -e $sandbox_home/$value ]] || bad "protected ~/$value doesn't exist yet, create it once with -u"
+        # A symlink (e.g. left by a -u run) would make bwrap mount whatever
+        # it points to, such as a host dir full of sockets
+        [[ ! -L $sandbox_home/$value ]] || bad "protected ~/$value is a symlink, check and remove it"
+        args+=(--ro-bind "$sandbox_home/$value" "$home/$value")
+        ;;
+      path)
+        p=$(expand_tilde "$value")
+        [[ $p == /* && $p != *:* ]] || bad "path needs an absolute dir or ~/..., without ':'"
+        extra_path+=("$p")
+        ;;
+      env)
+        [[ $value =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || bad "env needs NAME=VALUE"
+        case ${BASH_REMATCH[1]} in
+          PATH | HOME | FOAM*) bad "${BASH_REMATCH[1]} can't be set with env" ;;
+        esac
+        args+=(--setenv "${BASH_REMATCH[1]}" "$(expand_tilde "${BASH_REMATCH[2]}")")
+        ;;
+      net)
+        case $value in
+          yes | no | pasta) net=$value ;;
+          *) bad "net needs yes, no or pasta" ;;
+        esac
+        ;;
+      seccomp) seccomp=$(yes_no "$value") || bad "seccomp needs yes or no" ;;
+      audit) audit=$(yes_no "$value") || bad "audit needs yes or no" ;;
+      *)
+        bad "unknown directive '$key'"
+        ;;
+    esac
+  done <"$conf"
+
+  if ((${#extra_path[@]})); then
+    sandbox_path=$(IFS=:; echo "${extra_path[*]}"):$sandbox_path
+  fi
+}
+
+# --- 8. Terminal --------------------------------------------------------------
+# Block TIOCSTI: injecting keystrokes into your real terminal, to run after
+# the sandbox exits. The seccomp filter or newer kernels (legacy_tiocsti =
+# 0) block it; otherwise start a new session, which costs job control.
+add_tty_protection() {
+  [[ -z $seccomp ]] || return 0   # the seccomp filter blocks TIOCSTI
+  if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || true) != 0 ]]; then
+    args+=(--new-session)
+  fi
+}
+
+# --- 8b. Network -------------------------------------------------------------
+# net yes shares the host's network namespace, and with it localhost
+# services and abstract Unix sockets (X11 listens on one). net pasta gives
+# the sandbox its own namespace, and pasta turns its traffic into normal
+# connections from the host. No ports are forwarded either way, and the
+# gateway address doesn't lead to the host's loopback.
+pasta_opts=(
+  --config-net --quiet
+  -t none -u none        # nothing forwarded into the sandbox
+  -T none -U none        # nothing from it to the host's loopback
+  --no-map-gw            # the gateway address doesn't mean the host either
+  --dns-forward 169.254.1.1   # DNS sent here goes to the host's resolver
+)
+
+add_network() {
+  case $net in
+    yes) args+=(--share-net) ;;
+    no) ;;
+    pasta)
+      command -v pasta >/dev/null || die "net pasta needs pasta (package: passt)"
+      # bwrap runs as root in pasta's namespace: map back to your ids and
+      # drop all capabilities
+      args+=(--share-net --uid "$(id -u)" --gid "$(id -g)" --cap-drop ALL)
+      # The host's resolver may listen on its loopback (systemd-resolved),
+      # which isn't reachable from here: ask pasta's DNS forwarder instead
+      local target=/etc/resolv.conf
+      if [[ -L $target ]]; then target=$(realpath -m "$target"); fi
+      write_file "$data_dir/resolv.conf" "nameserver 169.254.1.1"
+      args+=(--ro-bind "$data_dir/resolv.conf" "$target")
+      ;;
+  esac
+}
+
+# --- 8c. Seccomp (config: seccomp yes) ----------------------------------------
+# A syscall filter for bwrap, built with libseccomp (called directly, so
+# only python3 is needed). Modeled on Flatpak's filter. Everything not
+# listed is allowed; 32-bit programs are killed, since their syscalls
+# could otherwise get around the rules.
+make_seccomp() {
+  python3 - <<'PY_SECCOMP'
+import ctypes, ctypes.util, errno, os, sys
+
+lib = ctypes.CDLL(ctypes.util.find_library("seccomp") or "libseccomp.so.2")
+
+class Cmp(ctypes.Structure):  # struct scmp_arg_cmp
+    _fields_ = [("arg", ctypes.c_uint), ("op", ctypes.c_int),
+                ("a", ctypes.c_uint64), ("b", ctypes.c_uint64)]
+
+EQ, GE, MASKED_EQ = 4, 5, 7
+ALLOW = 0x7FFF0000
+lib.seccomp_init.restype = ctypes.c_void_p
+lib.seccomp_init.argtypes = [ctypes.c_uint32]
+lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+lib.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
+                                       ctypes.c_uint, ctypes.POINTER(Cmp)]
+lib.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+ctx = lib.seccomp_init(ALLOW)
+if not ctx:
+    sys.exit("seccomp_init failed")
+
+def deny(err, call, *cmps):
+    nr = lib.seccomp_syscall_resolve_name(call.encode())
+    if nr == -1:
+        sys.exit(f"libseccomp doesn't know {call}, too old?")
+    rc = lib.seccomp_rule_add_array(ctx, 0x00050000 | err, nr, len(cmps),
+                                    (Cmp * len(cmps))(*cmps) if cmps else None)
+    if rc < 0:
+        sys.exit(f"seccomp rule for {call}: {os.strerror(-rc)}")
+
+# Kernel keyring: not namespaced, holds e.g. Kerberos tickets
+for call in ("add_key", "keyctl", "request_key"):
+    deny(errno.EPERM, call)
+
+# Typing into your terminal (TIOCSTI) and console paste (TIOCLINUX).
+# Compared on 32 bits, so junk in the upper half can't slip past.
+for request in (0x5412, 0x541C):
+    deny(errno.EPERM, "ioctl", Cmp(1, MASKED_EQ, 0xFFFFFFFF, request))
+
+# New user namespaces. clone3 hides its flags from seccomp, so programs
+# are told it doesn't exist and fall back to clone, which can be checked.
+CLONE_NEWUSER = 0x10000000
+for call in ("clone", "unshare"):
+    deny(errno.EPERM, call, Cmp(0, MASKED_EQ, CLONE_NEWUSER, CLONE_NEWUSER))
+deny(errno.ENOSYS, "clone3")
+
+# Big kernel interfaces, rarely needed and a common start of exploits
+for call in ("io_uring_setup", "io_uring_enter", "io_uring_register"):
+    deny(errno.ENOSYS, call)
+for call in ("bpf", "userfaultfd", "perf_event_open", "syslog", "uselib",
+             "modify_ldt", "mount", "umount2", "pivot_root", "chroot"):
+    deny(errno.EPERM, call)
+for call in ("fsopen", "fsconfig", "fsmount", "fspick", "open_tree",
+             "move_mount", "mount_setattr"):
+    deny(errno.ENOSYS, call)
+
+# Only Unix, IPv4, IPv6 and netlink sockets: modules for rarely used
+# protocols are a classic source of kernel bugs
+allowed = {1, 2, 10, 16}  # AF_UNIX, AF_INET, AF_INET6, AF_NETLINK
+for family in range(64):
+    if family not in allowed:
+        deny(errno.EAFNOSUPPORT, "socket", Cmp(0, EQ, family))
+deny(errno.EAFNOSUPPORT, "socket", Cmp(0, GE, 64))
+
+rc = lib.seccomp_export_bpf(ctx, sys.stdout.fileno())
+if rc < 0:
+    sys.exit(f"seccomp export: {os.strerror(-rc)}")
+PY_SECCOMP
+}
+
+# --- 9. Git -------------------------------------------------------------------
+# Host git (yours, your prompt's, your IDE's) runs code a repo's .git names:
+# hooks, and commands in its config (fsmonitor, filters, pager, aliases...).
+# So in every repo near the top of the working directory these parts of
+# .git are read-only; objects, refs, index and logs stay writable, so
+# commits work:
+#   config, config.worktree   commands git runs, includes, hooksPath
+#   hooks/                    scripts run by git commit, push, ...
+#   info/                     exclude (hide files), attributes (hide diffs)
+#   refs/replace/             replace refs change what log/show display
+#   modules/, worktrees/      submodule/worktree git dirs with own config
+protect_git_dir() {   # $1: a .git dir or file
+  local g=$1 p
+  # Git never puts symlinks here; one would make bwrap mount its target
+  for p in "$g" "$g"/{hooks,info,refs,refs/replace,config,config.worktree,modules,worktrees}; do
+    [[ ! -L $p ]] || die "refusing to run: $p is a symlink, check it"
+  done
+  if [[ ! -d $g ]]; then
+    # A .git file points to a git dir elsewhere (worktree, submodule),
+    # which isn't visible in here; keep the pointer itself read-only
+    args+=(--ro-bind "$g" "$g")
+    return
+  fi
+  # Create missing ones first, or the sandbox could create them itself
+  # (e.g. a hooks/ dir full of hooks). Empty ones change nothing for git.
+  mkdir -p "$g/hooks" "$g/info" "$g/refs/replace"
+  [[ -e $g/config.worktree ]] || : >"$g/config.worktree"
+  for p in config config.worktree hooks info refs/replace modules worktrees; do
+    if [[ -e $g/$p ]]; then args+=(--ro-bind "$g/$p" "$g/$p"); fi
+  done
+}
+
+add_git_protection() {
+  local g repos=0
+  # .git dirs and files up to 3 levels down. Dependency and build dirs are
+  # skipped: package managers fill them, and a read-only mount inside one
+  # would make npm, composer or pip fail to replace it.
+  while IFS= read -r -d '' g; do
+    protect_git_dir "$g"
+    if [[ -d $g ]]; then repos=$((repos + 1)); fi
+  done < <(find "$work" -maxdepth 3 \
+            \( -name node_modules -o -name vendor -o -name .venv -o -name venv \
+              -o -name __pypackages__ -o -name .gradle \) -prune \
+            -o -name .git -print0 -prune)
+
+  if ((repos > 1)); then
+    echo "foam: warning: $repos repos below $work; files planted in a parent dir can affect tools in all of them" >&2
+  fi
+}
+
+# --- 10. Audit (config: audit yes) -------------------------------------------
+# After the run, report: new commits, changed refs, git status, and every
+# file whose ctime is newer than the start (ctime can't be faked from
+# userspace, unlike mtime), which also covers git-ignored files and the
+# profile home.
+
+# Host git for the report: pinned to the repo found before the run (a .git
+# the sandbox creates meanwhile is ignored), with the settings that make
+# git run commands or follow replace refs switched off
+git_host() {
+  git -C "$work" --git-dir="$git_dir" --work-tree="$git_top" --no-replace-objects \
+    -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat \
+    -c log.showSignature=false "$@"
+}
+git_refs() { git_host for-each-ref --format='%(refname) %(objectname:short)'; }
+
+snapshot_git() {    # remember the repo and its state before the run
+  in_git= git_dir= git_top= refs_before= head_before=
+  command -v git >/dev/null || return 0
+  git_dir=$(git -C "$work" -c core.fsmonitor=false rev-parse --absolute-git-dir 2>/dev/null) || return 0
+  git_top=$(git -C "$work" -c core.fsmonitor=false rev-parse --show-toplevel 2>/dev/null) || return 0
+  in_git=1
+  refs_before=$(git_refs)
+  head_before=$(git_host rev-parse -q --verify HEAD || true)
+}
+
+# File names and commit messages come from the sandbox. Make control
+# characters (terminal escape sequences, newlines inside names) harmless
+# before they reach the report, so it can't be hidden or faked.
+sanitize() { LC_ALL=C sed 's/[[:cntrl:]]/?/g; s/\xc2[\x80-\x9f]/?/g'; }
+
+# Names NUL-terminated, then newlines inside names become '?'
+list_names() { tr '\n\0' '?\n' | sanitize; }
+
+changed_files() {   # files under $1 changed since the run started
+  (cd "$1" && find . -path ./.git -prune -o ! -type d -cnewer "$stamp" -printf '%P\0' | list_names | sort)
+}
+
+summarize() {       # changed files counted per top-level entry
+  cut -d/ -f1 | sort | uniq -c | sort -rn | sed -n '1,15s/^/    /p'
+}
+
+report_changes() {
+  local log=$data_dir/$profile/last-changes.txt
+  local project home_changes= nested git_changes= commits= refs= replaced= hooks_dir hook_changes=
+  project=$(changed_files "$work")
+  [[ -n $tmp_home ]] || home_changes=$(changed_files "$sandbox_home")
+  # A new .git in or below the working dir would make host git commands
+  # there use its config (hooks, fsmonitor, ...)
+  nested=$(cd "$work" && find . -mindepth 2 -name .git -cnewer "$stamp" -printf '%P\0' | list_names)
+  if [[ -z $git_existed && -e $work/.git ]]; then
+    nested=.git${nested:+$'\n'$nested}
+  fi
+
+  if [[ -n $in_git ]]; then
+    git_changes=$(git_host status --short --untracked-files=all -- . | sanitize)
+    # Commits reachable from HEAD now but not before (all, if HEAD was new)
+    commits=$(git_host log --oneline ${head_before:+"^$head_before"} HEAD 2>/dev/null | sanitize || true)
+    # Branches/tags added (+), removed or moved (-)
+    refs=$(comm -3 <(printf '%s\n' "$refs_before" | sed '/^$/d' | sort) <(git_refs | sort) |
+      sed 's/^\t/+ /; t; s/^/- /')
+    replaced=$(git_host for-each-ref refs/replace)
+    # core.hooksPath inside the project (e.g. husky's .husky) means hooks
+    # are ordinary files the sandbox can change
+    hooks_dir=$(git_host config --get core.hooksPath || true)
+    case $hooks_dir in
+      "$work"/*) hooks_dir=${hooks_dir#"$work"/} ;;  # absolute, in project
+      /* | "~"*) hooks_dir= ;;                       # outside the project
+    esac
+    hooks_dir=${hooks_dir#./}
+    if [[ -n $hooks_dir ]]; then
+      local f
+      while IFS= read -r f; do
+        if [[ $f == "${hooks_dir%/}"/* ]]; then hook_changes+=$f$'\n'; fi
+      done <<<"$project"
+      hook_changes=${hook_changes%$'\n'}
+    fi
+  fi
+
+  {
+    echo "foam run finished $(date), profile: $profile, directory: $work"
+    printf '\n== new commits on HEAD\n%s\n' "${commits:-(none)}"
+    printf '\n== changed refs\n%s\n' "${refs:-(none)}"
+    printf '\n== replace refs\n%s\n' "${replaced:-(none)}"
+    printf '\n== git status\n%s\n' "${git_changes:-(none)}"
+    printf '\n== changed files in project\n%s\n' "${project:-(none)}"
+    printf '\n== changed files in profile home\n%s\n' "${home_changes:-(none)}"
+    printf '\n== new or changed nested .git\n%s\n' "${nested:-(none)}"
+  } >"$log"
+
+  if [[ -z $project && -z $home_changes && -z $commits && -z $refs && -z $nested ]] ; then
+    echo "foam: no changes" >&2
+    return
+  fi
+  {
+    echo "foam: changes during this run (full list: $log)"
+    if [[ -n $commits ]]; then
+      echo "  new commits${head_before:+ (review: git diff ${head_before:0:12} HEAD)}:"
+      sed -n '1,20s/^/    /p' <<<"$commits"
+    fi
+    if [[ -n $refs ]]; then
+      echo "  changed branches/tags:"
+      sed -n '1,20s/^/    /p' <<<"$refs"
+    fi
+    if [[ -n $git_changes ]]; then
+      echo "  git status:"
+      sed -n '1,20s/^/    /p' <<<"$git_changes"
+    fi
+    if [[ -n $project ]]; then
+      echo "  project, files per top-level entry (incl. git-ignored):"
+      summarize <<<"$project"
+    fi
+    if [[ -n $home_changes ]]; then
+      echo "  profile home, files per top-level entry:"
+      summarize <<<"$home_changes"
+    fi
+    if [[ -n $replaced ]]; then
+      echo "  WARNING: replace refs exist, git log/show may not show the real history (check: git replace -l)"
+    fi
+    if [[ -n $hook_changes ]]; then
+      echo "  WARNING: hooks changed in $hooks_dir (core.hooksPath), they run on the host:"
+      sed 's/^/    /' <<<"$hook_changes"
+    fi
+    if [[ -n $nested ]]; then
+      echo "  WARNING: new or changed nested .git, don't run git there before checking:"
+      sed 's/^/    /' <<<"$nested"
+    fi
+  } >&2
+}
+
+# --- 11. Run ------------------------------------------------------------------
+# Close file descriptors inherited from whatever started foam (except
+# stdin/out/err): an open fd would reach into the sandbox past all mounts.
+# 255 is bash's handle on this script.
+close_fds() {
+  local fd
+  for fd in /proc/self/fd/*; do
+    fd=${fd##*/}
+    if ((fd > 2 && fd != 255)); then { exec {fd}>&-; } 2>/dev/null || true; fi
+  done
+}
+
+print_command() {   # the launch command, one bwrap option per line
+  local a q
+  printf '%q' "$1"
+  shift
+  for a in "$@"; do
+    # Arguments with spaces in single quotes, the rest shell-escaped
+    if [[ $a == *[[:space:]]* ]]; then q=${a@Q}; else printf -v q '%q' "$a"; fi
+    if [[ $a == --* ]]; then printf ' \\\n  %s' "$q"; else printf ' %s' "$q"; fi
+  done
+  printf '\n'
+}
+
+run() {
+  local cmd=("$@") status=0 launch bpf=FILTER.bpf
+  if ((${#cmd[@]} == 0)); then
+    cmd=(bash --rcfile /run/foam.bashrc -i)
+  fi
+  write_file "$data_dir/bashrc" "$rcfile"
+  args+=(--ro-bind "$data_dir/bashrc" /run/foam.bashrc)
+
+  if [[ -n $seccomp ]]; then
+    args+=(--seccomp 4)
+    if [[ -z $dry_run ]]; then
+      bpf=$(mktemp)
+      make_seccomp >"$bpf" || { rm -f "$bpf"; die "couldn't build the seccomp filter (needs python3 and libseccomp)"; }
+    fi
+  fi
+
+  # What starts the sandbox, built from the inside out
+  launch=(bwrap "${args[@]}" -- "${cmd[@]}")
+  if [[ -n $seccomp ]]; then
+    # bwrap reads the filter from fd 4. A tiny shell opens it just before
+    # bwrap starts and deletes the file (pasta closes inherited fds).
+    local open_fd4='
+      exec 4<"$1" &&     # open the filter file as fd 4
+      rm -f -- "$1" &&   # delete it: the open fd keeps working
+      shift &&           # drop the path, so "$@" is the bwrap command
+      exec "$@"          # become bwrap, which inherits fd 4
+    '
+    launch=(
+      bash -c "$open_fd4"
+      foam              # $0: the shell's name, shown in its error messages
+      "$bpf"            # $1: filter file, opened as fd 4 and then deleted
+      "${launch[@]}"    # $2...: the bwrap command the shell turns into
+    )
+  fi
+  if [[ $net == pasta ]]; then
+    launch=(pasta "${pasta_opts[@]}" -- "${launch[@]}")
+  fi
+
+  if [[ -n $dry_run ]]; then
+    print_command "${launch[@]}"
+    return
+  fi
+  close_fds
+  if [[ -z $audit ]]; then
+    exec "${launch[@]}"
+  fi
+
+  # Audit: run the sandbox as a child so the changes can be reported
+  # afterwards. The INT trap keeps foam alive after Ctrl+C (bwrap still
+  # gets it).
+  snapshot_git
+  git_existed=
+  if [[ -e $work/.git ]]; then git_existed=1; fi
+  # Start marker, created after foam's own setup. File times come from a
+  # coarse clock (a few ms per tick) and -cnewer means strictly newer, so
+  # wait a tick before starting: every change in the sandbox is then newer.
+  stamp=$(mktemp)
+  sleep 0.05
+  trap : INT
+  "${launch[@]}" || status=$?
+  report_changes
+  rm -f "$stamp"
+  exit "$status"
+}
+
+# --- Main ---------------------------------------------------------------------
+main() {
+  parse_options "$@"
+  shift "$((OPTIND - 1))"
+  command -v bwrap >/dev/null || die "bwrap not found, install the 'bubblewrap' package"
+
+  set_paths
+  check_workdir
+  add_system
+  add_environment
+  add_home
+  load_config                              # after add_home: may bind into it
+  add_network                              # after load_config: 'net'
+  args+=(--setenv PATH "$sandbox_path")    # after load_config: includes 'path'
+  args+=(--bind "$work" "$work" --chdir "$work")   # wins over ro binds above
+  add_git_protection                       # after the work bind: covers .git
+  add_tty_protection
+  run "$@"
+}
+
+main "$@"
