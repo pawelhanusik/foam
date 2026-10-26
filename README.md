@@ -52,9 +52,9 @@ foam limits the damage to what the tool actually needs: the project you're worki
 |---|---|
 | Everything | `bash`, `bwrap` (package `bubblewrap`), GNU coreutils, findutils and sed. All of these are standard on Fedora, Debian, Ubuntu and Arch; BusyBox-based images like Alpine aren't supported. |
 | Full protection | bubblewrap **0.8 or newer**, for `--disable-userns`. Older versions work but allow nested user namespaces. |
-| Audit report | `git` |
-| `seccomp yes` | `python3` and `libseccomp.so.2`, which is present wherever systemd is. No extra Python package is needed. |
-| `net pasta` | `pasta`, package `passt` |
+| Own network (default `net pasta`) | `pasta`, package `passt`. Without it, foam stops with an error until you install it or set `net yes` or `net no` in the profile. |
+| Seccomp filter (default `seccomp yes`) | `python3` and `libseccomp.so.2`, which is present wherever systemd is. No extra Python package is needed. Without them, foam stops with an error until you install them or set `seccomp no`. |
+| Audit report (default `audit yes`) | `git` for the commit, branch and `git status` parts; without it, only changed files are reported |
 
 ---
 
@@ -115,10 +115,10 @@ foam builds the sandbox as an **allowlist**: the sandbox starts with an empty fi
 | Its profile home | Read-write and persistent: `~/.local/share/foam/<profile>/home`, mounted at your normal `$HOME` path. Each profile has its own, and `-t` gives an empty, temporary one instead. |
 | The system | `/usr` and `/etc` read-only, plus `/bin`, `/lib` etc. as they exist on the system, so all installed programs work. |
 | Private temp dirs | `/tmp`, `/var/tmp` and `/run` are empty, private and in memory, discarded on exit. |
-| Network | Depends on the profile's [`net` setting](#network-modes): shared (default), none, or its own network through pasta. |
+| Network | Depends on the profile's [`net` setting](#network-modes): its own network through pasta (default), the host's network, or none. |
 | Processes | Starting programs, threads and subprocesses, and debugging its own processes. |
 | Git | `status`, `diff`, `log`, commits and branches. The parts of `.git` that can run code are read-only; see [Git protection](#git-protection). |
-| Interactive work | A normal shell with history (per profile) and job control. Job control is lost only if your kernel still allows legacy `TIOCSTI` (`/proc/sys/dev/tty/legacy_tiocsti` isn't `0`) and `seccomp yes` is off. |
+| Interactive work | A normal shell with history (per profile) and job control. Job control is lost only if your kernel still allows legacy `TIOCSTI` (`/proc/sys/dev/tty/legacy_tiocsti` isn't `0`) and the seccomp filter is turned off (`seccomp no`). |
 
 ### Blocked
 
@@ -138,13 +138,13 @@ foam builds the sandbox as an **allowlist**: the sandbox starts with an empty fi
 | Inherited file descriptors | Everything except stdin, stdout and stderr is closed before the sandbox starts. |
 | GUI apps | No display access, by design. (With `net yes`, see the X11 note under [Network modes](#network-modes).) |
 
-With a profile option:
+Profile settings that block more. The first two are on by default; turning them off in a profile (`net yes`, `seccomp no`) gives these up:
 
-| Option | Additionally blocks |
+| Setting | Additionally blocks |
 |---|---|
+| `net pasta` (default) | Host localhost services and abstract sockets (e.g. X11), while internet access keeps working |
+| `seccomp yes` (default) | Kernel keyring (Kerberos tickets), `TIOCSTI`/`TIOCLINUX`, io_uring, eBPF, userfaultfd, `perf_event_open`, mount syscalls, unusual socket types, 32-bit programs |
 | `net no` | All network access, including host localhost services and abstract sockets |
-| `net pasta` | Host localhost services and abstract sockets (e.g. X11), while internet access keeps working |
-| `seccomp yes` | Kernel keyring (Kerberos tickets), `TIOCSTI`/`TIOCLINUX`, io_uring, eBPF, userfaultfd, `perf_event_open`, mount syscalls, unusual socket types, 32-bit programs |
 
 ---
 
@@ -231,11 +231,11 @@ Configs are **parsed, never executed**: no shell code runs from them, and a typo
 | `protect NAME` | A file or directory **directly** in the profile home (no `/`) stays read-only, except in `-u` runs. It must already exist (create it with a `-u` run) and must not be a symlink. |
 | `path DIR` | Prepend `DIR` to `PATH` inside the sandbox. Several lines keep their order. |
 | `env NAME=VALUE` | Set an environment variable inside the sandbox. `PATH`, `HOME` and `FOAM*` can't be set this way. |
-| `net yes\|no\|pasta` | Network mode; see [Network modes](#network-modes). Default `yes`. |
-| `seccomp yes\|no` | Syscall filter; see [Seccomp filter](#seccomp-filter). Default `no`. |
-| `audit yes\|no` | Report all changes after each run; see [Audit mode](#audit-mode). Default `no`. |
+| `net yes\|no\|pasta` | Network mode; see [Network modes](#network-modes). Default `pasta`. |
+| `seccomp yes\|no` | Syscall filter; see [Seccomp filter](#seccomp-filter). Default `yes`. |
+| `audit yes\|no` | Report all changes after each run; see [Audit mode](#audit-mode). Default `yes`. |
 
-Example profiles:
+A profile without a config file gets the defaults: own network through pasta, the seccomp filter and audit mode. Example profiles:
 
 ```
 # ~/.config/foam/node.conf - npm and friends
@@ -245,21 +245,23 @@ path ~/.npm-global/bin
 protect .npm-global
 protect .npmrc
 protect .bashrc
-seccomp yes
-audit yes
 ```
 
 ```
 # ~/.config/foam/agent.conf - an AI agent with its own token in its own home
-net pasta
-seccomp yes
-audit yes
+# (nothing to set: the defaults are what it needs)
 ```
 
 ```
 # ~/.config/foam/offline.conf - tests that need no network at all
 net no
-seccomp yes
+```
+
+```
+# ~/.config/foam/localdb.conf - talks to a database on the host's localhost
+# (gives up pasta's isolation: localhost services and abstract sockets
+# become reachable)
+net yes
 ```
 
 `protect` only protects a path from *normal* runs. A `-u` run can be influenced by any writable file it reads, so also protect files like `.npmrc` and `.bashrc` in the profile home, and run `-u` commands non-interactively.
@@ -295,7 +297,7 @@ If foam finds more than one repository below the working directory, it warns. A 
 
 ## Audit mode
 
-With `audit yes`, foam reports everything the sandbox changed when it exits:
+Audit mode is on by default (`audit no` turns it off). When the sandbox exits, foam reports everything it changed:
 
 ```
 foam: changes during this run (full list: ~/.local/share/foam/node/last-changes.txt)
@@ -337,8 +339,8 @@ Some things to know:
 
 | `net` | Internet | Host localhost services | Abstract sockets (e.g. X11) |
 |---|---|---|---|
-| `yes` (default) | ✅ | ⚠️ reachable | ⚠️ reachable |
-| `pasta` | ✅ | ❌ blocked | ❌ blocked |
+| `pasta` (default) | ✅ | ❌ blocked | ❌ blocked |
+| `yes` | ✅ | ⚠️ reachable | ⚠️ reachable |
 | `no` | ❌ | ❌ blocked | ❌ blocked |
 
 **Why `yes` isn't fully isolated:** sharing the host's network namespace also shares two things that aren't the internet:
@@ -356,7 +358,7 @@ bwrap runs as root inside pasta's namespace, so foam maps your user and group ID
 
 ## Seccomp filter
 
-`seccomp yes` adds a syscall filter, modeled on Flatpak's and built at each run by calling libseccomp directly from Python. Everything not listed is allowed.
+The seccomp filter is on by default (`seccomp no` turns it off). It's a syscall filter modeled on Flatpak's, built at each run by calling libseccomp directly from Python. Everything not listed is allowed.
 
 | Blocked | Why |
 |---|---|
@@ -382,12 +384,15 @@ These tests check the sandbox on your real system. Each test lists the expected 
 
 ### Setup
 
+Install `passt` first, since `net pasta` is the default. Tests without `-p` use the `default` profile with the default settings (own network through pasta, seccomp, audit). If you have a `~/.config/foam/default.conf`, move it aside while testing. Because audit mode is on, every run ends with a short change report on stderr; that's expected.
+
+The test profiles below switch single settings *off* or change them, for comparison:
+
 ```bash
 mkdir -p ~/.config/foam ~/foam-test && cd ~/foam-test
-printf 'net no\n'                 > ~/.config/foam/t-offline.conf
-printf 'seccomp yes\n'            > ~/.config/foam/t-seccomp.conf
-printf 'net pasta\nseccomp yes\n' > ~/.config/foam/t-pasta.conf
-printf 'audit yes\n'              > ~/.config/foam/t-audit.conf
+printf 'net no\n'     > ~/.config/foam/t-offline.conf
+printf 'net yes\n'    > ~/.config/foam/t-shared.conf
+printf 'seccomp no\n' > ~/.config/foam/t-noseccomp.conf
 foam -n | head -20    # dry run: read what the sandbox gets
 ```
 
@@ -425,7 +430,7 @@ foam unshare -U true              # expect: fails (Operation not permitted or No
                                   #   succeeds only with bwrap older than 0.8 and seccomp off
 TEST_SECRET=leak foam env | grep TEST_SECRET   # expect: no output
 exec 7</etc/os-release; foam ls /proc/self/fd; exec 7<&-
-                                  # expect: 0 1 2 and maybe 3 (ls's own), but no 7
+                                  # expect: no 7 in the list
 foam ls /dev                      # expect: a handful of entries, no dri/, input/, video*, kvm
 ```
 
@@ -471,25 +476,27 @@ ls /tmp/pwned                                                  # expect: No such
 ### 7. Seccomp
 
 ```bash
-foam -p t-seccomp python3 -c 'import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW)'
+foam python3 -c 'import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW)'
                         # expect: Address family not supported by protocol
-                        # (without seccomp you'd get "Operation not permitted" instead)
-foam -p t-seccomp keyctl show @s
+foam -p t-noseccomp python3 -c 'import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW)'
+                        # seccomp off, for comparison: Operation not permitted
+foam keyctl show @s
                         # expect: fails with Operation not permitted (needs the keyutils package)
-foam -p t-seccomp bash -c 'sleep 1 & wait; echo processes-ok'
+foam bash -c 'sleep 1 & wait; echo processes-ok'
                         # expect: processes-ok (normal work unaffected)
 ```
 
-If you use Kerberos, `klist` inside a `seccomp yes` profile should find no tickets, while it shows them on the host.
+If you use Kerberos, `klist` inside foam should find no tickets, while it shows them on the host.
 
 ### 8. Network modes
 
 ```bash
-foam curl -sI https://example.com | head -1            # expect: HTTP/... 200 (net yes)
-foam -p t-offline curl -m5 -sI https://example.com     # expect: fails, could not resolve host (net no)
+foam curl -sI https://example.com | head -1              # expect: HTTP/... 200 (net pasta, the default)
+foam -p t-shared curl -sI https://example.com | head -1  # expect: HTTP/... 200 (net yes)
+foam -p t-offline curl -m5 -sI https://example.com       # expect: fails, could not resolve host (net no)
 ```
 
-### 9. pasta isolation (`net pasta`)
+### 9. pasta isolation (`net pasta`, the default)
 
 Start a server that listens **only on the host's localhost**:
 
@@ -502,28 +509,28 @@ Then check:
 
 ```bash
 # 9.1 Internet and DNS work
-foam -p t-pasta curl -sI https://example.com | head -1
+foam curl -sI https://example.com | head -1
                         # expect: HTTP/... 200
-foam -p t-pasta getent hosts example.com
+foam getent hosts example.com
                         # expect: an IP address
 
 # 9.2 Host localhost is NOT reachable (compare with net yes)
-foam -p t-pasta curl -m3 http://127.0.0.1:8765         # expect: fails (connection refused / timeout)
-foam curl -m3 -s http://127.0.0.1:8765 | head -2       # net yes, for comparison: a directory listing
+foam curl -m3 http://127.0.0.1:8765         # expect: fails (connection refused / timeout)
+foam -p t-shared curl -m3 -s http://127.0.0.1:8765 | head -2   # net yes, for comparison: a directory listing
 
 # 9.3 The gateway address doesn't lead to the host either
-gw=$(foam -p t-pasta sh -c "ip route | awk '/^default/ {print \$3; exit}'")
-foam -p t-pasta curl -m3 "http://$gw:8765"             # expect: fails
+gw=$(foam sh -c "ip route | awk '/^default/ {print \$3; exit}'")
+foam curl -m3 "http://$gw:8765"             # expect: fails
 
 # 9.4 Abstract X11 socket is NOT reachable (needs an X server or Xwayland running)
 d=${DISPLAY#*:}; d=${d%.*}
-foam -p t-pasta python3 -c "import socket; socket.socket(socket.AF_UNIX).connect('\0/tmp/.X11-unix/X$d'); print('CONNECTED: NOT protected')"
+foam python3 -c "import socket; socket.socket(socket.AF_UNIX).connect('\0/tmp/.X11-unix/X$d'); print('CONNECTED: NOT protected')"
                         # expect: ConnectionRefusedError
-foam python3 -c "import socket; socket.socket(socket.AF_UNIX).connect('\0/tmp/.X11-unix/X$d'); print('CONNECTED')"
+foam -p t-shared python3 -c "import socket; socket.socket(socket.AF_UNIX).connect('\0/tmp/.X11-unix/X$d'); print('CONNECTED')"
                         # net yes, for comparison: usually CONNECTED, which is why pasta matters
 
 # 9.5 Exit codes come through pasta
-foam -p t-pasta sh -c 'exit 7'; echo $?                # expect: 7
+foam sh -c 'exit 7'; echo $?                # expect: 7
 
 kill $SERVER
 ```
@@ -534,7 +541,7 @@ If pasta stops with an unknown-option error: newer passt releases are replacing 
 
 ```bash
 cd ~/foam-test && echo node_modules/ > .gitignore
-foam -p t-audit sh -c '
+foam sh -c '
   echo c >> a.txt
   mkdir -p node_modules/x && echo evil > node_modules/x/i.js
   touch -d 2001-01-01 node_modules/x/i.js

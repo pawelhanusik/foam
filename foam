@@ -22,15 +22,17 @@
 #                   (except with -u); must exist, create it once with -u
 #   path DIR        prepend DIR to PATH inside the sandbox
 #   env NAME=VALUE  set an environment variable inside the sandbox
-#   net yes|no|pasta  network: yes = share the host's (default), no = none,
-#                   pasta = own network through pasta (package: passt),
-#                   so localhost services and abstract sockets (e.g. X11)
-#                   stay out of reach
+#   net yes|no|pasta  network: pasta (default) = own network through pasta
+#                   (package: passt), so localhost services and abstract
+#                   sockets (e.g. X11) stay out of reach; yes = share the
+#                   host's; no = none
 #   seccomp yes|no  block syscalls that are risky and rarely needed: kernel
 #                   keyring, terminal injection, io_uring, odd socket types,
-#                   32-bit programs... (needs python3 and libseccomp)
+#                   32-bit programs... (default yes; needs python3 and
+#                   libseccomp)
 #   audit yes|no    after each run, report all changes: files (also
 #                   git-ignored ones and the profile home), commits, refs
+#                   (default yes)
 #
 # Examples:
 #   foam                     shell in the current directory
@@ -45,9 +47,9 @@ tmp_home=
 update=
 dry_run=
 
-net=yes           # config: net yes|no|pasta
-seccomp=          # config: seccomp yes
-audit=            # config: audit yes
+net=pasta         # config: net yes|no|pasta
+seccomp=1         # config: seccomp no
+audit=1           # config: audit no
 
 # Interactive shell init, given to the sandbox as /run/foam.bashrc (a
 # read-only copy kept in foam's data dir).
@@ -84,7 +86,7 @@ parse_options() {
       u) update=1 ;;
       n) dry_run=1 ;;
       h) echo "usage: foam [-p PROFILE] [-t] [-u] [-n] [--] [COMMAND [ARGS...]]"
-         echo "details: comment at the top of $0"; exit 0 ;;
+         echo "details: see comment at the top of $0"; exit 0 ;;
       :) die "-$OPTARG needs an argument" ;;
       *) die "unknown option -$OPTARG (try -h)" ;;
     esac
@@ -357,7 +359,7 @@ add_network() {
     yes) args+=(--share-net) ;;
     no) ;;
     pasta)
-      command -v pasta >/dev/null || die "net pasta needs pasta (package: passt)"
+      command -v pasta >/dev/null || die "net pasta (the default) needs pasta (package: passt); install it, or set 'net yes' or 'net no' in $conf"
       # bwrap runs as root in pasta's namespace: map back to your ids and
       # drop all capabilities
       args+=(--share-net --uid "$(id -u)" --gid "$(id -g)" --cap-drop ALL)
@@ -664,7 +666,7 @@ run() {
     args+=(--seccomp 4)
     if [[ -z $dry_run ]]; then
       bpf=$(mktemp)
-      make_seccomp >"$bpf" || { rm -f "$bpf"; die "couldn't build the seccomp filter (needs python3 and libseccomp)"; }
+      make_seccomp >"$bpf" || { rm -f "$bpf"; die "couldn't build the seccomp filter (needs python3 and libseccomp); install them, or set 'seccomp no' in $conf"; }
     fi
   fi
 
