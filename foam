@@ -194,6 +194,38 @@ add_system() {
     r=$(realpath /etc/resolv.conf)
     if [[ -e $r ]]; then args+=(--ro-bind "$r" "$r"); fi
   fi
+
+  local -A ssh_seen=()
+  add_ssh_includes /etc/ssh/ssh_config
+}
+
+# ssh refuses files it Includes unless they're owned by root or you, and in
+# here root's files show up as owned by nobody. Each file reachable through
+# Include from the system config gets a read-only copy owned by you, mounted
+# over the original (its symlink target, if it is one).
+add_ssh_includes() { # FILE [DEPTH]
+  local file=$1 depth=${2:-0} line pat f r copy pats
+  ((depth < 16)) || return 0
+  [[ -f $file && -r $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee]([[:space:]]*=[[:space:]]*|[[:space:]]+)(.*)$ ]] || continue
+    read -ra pats <<<"${BASH_REMATCH[2]}"
+    for pat in "${pats[@]}"; do
+      [[ $pat != "~"* ]] || continue          # in your home: yours already
+      [[ $pat == /* ]] || pat=/etc/ssh/$pat
+      while IFS= read -r f; do
+        r=$(realpath -q -- "$f") || continue
+        if [[ ! -f $r || ! -r $r || -O $r || -n ${ssh_seen[$r]:-} ]]; then continue; fi
+        ssh_seen[$r]=1
+        copy=$data_dir/ssh-includes$r
+        mkdir -p "${copy%/*}"
+        write_file "$copy" "$(<"$r")"
+        chmod go-w "$copy"
+        args+=(--ro-bind "$copy" "$r")
+        add_ssh_includes "$r" $((depth + 1))
+      done < <(compgen -G "$pat" || true)
+    done
+  done <"$file"
 }
 
 # --- 5. Environment -----------------------------------------------------------
