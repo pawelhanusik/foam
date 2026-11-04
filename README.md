@@ -229,6 +229,7 @@ Configs are **parsed, never executed**: no shell code runs from them, and a typo
 |---|---|
 | `ro PATH` | Read-only access to a real file or directory, e.g. `ro ~/.gitconfig`. Skipped if it doesn't exist. Refused for `/run`, `/tmp`, `/var/tmp`, `/dev`, `/proc`, `/sys`, `$XDG_RUNTIME_DIR`, foam's own directories, and anything containing a socket or FIFO, because read-only doesn't stop connecting to a socket. Symlink targets are checked too. |
 | `protect NAME` | A file or directory **directly** in the profile home (no `/`) stays read-only, except in `-u` runs. It must already exist (create it with a `-u` run) and must not be a symlink. |
+| `rw PATH` | A writable hole inside a `protect`ed name, e.g. `rw .claude/sessions` under `protect .claude`. The path is relative to the profile home, must already exist and must not go through a symlink. `{work}` in it becomes the working directory with every character except letters and digits replaced by `-`, e.g. `rw .claude/projects/{work}`: each project then gets only its own folder, which is created on first use. Unused in `-u` runs, where everything is writable. |
 | `path DIR` | Prepend `DIR` to `PATH` inside the sandbox. Several lines keep their order. |
 | `env NAME=VALUE` | Set an environment variable inside the sandbox. `PATH`, `HOME` and `FOAM*` can't be set this way. |
 | `net yes\|no\|pasta` | Network mode; see [Network modes](#network-modes). Default `pasta`. |
@@ -251,6 +252,24 @@ protect .bashrc
 # ~/.config/foam/agent.conf - an AI agent with its own token in its own home
 # (nothing to set: the defaults are what it needs)
 ```
+
+```
+# ~/.config/foam/claude.conf - Claude Code shared by many projects, where a
+# prompt injection in one project can't plant settings, hooks, skills,
+# plugins or memories that load in the others
+protect .claude
+protect .claude.json          # holds mcpServers, commands run in every project
+protect .local                # the claude binary lives in ~/.local/share/claude
+env DISABLE_AUTOUPDATER=1     # update with: foam -u -p claude claude update
+rw .claude/.credentials.json  # token refresh (rewritten in place)
+rw .claude/history.jsonl
+rw .claude/sessions
+rw .claude/cache
+rw .claude/backups
+rw .claude/projects/{work}    # sessions and memory of this project only
+```
+
+Create every `rw` path once with a `-u` run first. Settings, skills and plugins are then changed with `-u` runs only.
 
 ```
 # ~/.config/foam/offline.conf - tests that need no network at all

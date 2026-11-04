@@ -20,6 +20,9 @@
 #   ro PATH         read-only bind of a real file/dir (skipped if missing)
 #   protect NAME    file/dir directly in the profile home stays read-only
 #                   (except with -u); must exist, create it once with -u
+#   rw PATH         writable hole inside a protected name, e.g.
+#                   .claude/sessions; must exist. {work} = the working dir
+#                   with non-alphanumerics as '-' (created on first use)
 #   path DIR        prepend DIR to PATH inside the sandbox
 #   env NAME=VALUE  set an environment variable inside the sandbox
 #   net yes|no|pasta  network: pasta (default) = own network through pasta
@@ -287,7 +290,8 @@ yes_no() {
 
 load_config() {
   [[ -f $conf ]] || return 0
-  local line key value p q real n=0 extra_path=()
+  local line key value p q real n=0 extra_path=() rw_paths=() rw_lines=() rw_auto=()
+  local -A protected=()
   bad() { die "$conf:$n: $*"; }
 
   while IFS= read -r line || [[ -n $line ]]; do
@@ -319,6 +323,7 @@ load_config() {
         # renamed or deleted from inside, but a parent directory could be
         # swapped for one with different content.
         [[ $value =~ ^[^/]+$ && $value != . && $value != .. ]] || bad "protect needs a name directly in the profile home (no '/')"
+        protected[$value]=1
         # With -u (or -t) no extra mount: the path stays part of the
         # writable profile home.
         [[ -z $update && -z $tmp_home ]] || continue
@@ -329,6 +334,19 @@ load_config() {
         # it points to, such as a host dir full of sockets
         [[ ! -L $sandbox_home/$value ]] || bad "protected ~/$value is a symlink, check and remove it"
         args+=(--ro-bind "$sandbox_home/$value" "$home/$value")
+        ;;
+      rw)
+        # A writable hole inside a protected path, e.g. a tool's cache or
+        # session dir. Mounted after all protect lines (see below).
+        # {work} becomes the working dir with every character except
+        # letters and digits replaced by '-' (how Claude Code names its
+        # per-project dirs), so each project gets only its own.
+        p=${value//\{work\}/${work//[^A-Za-z0-9]/-}}
+        [[ $p =~ ^[^/]+/.+ && /$p/ != */../* && /$p/ != */./* && $p != *//* && $p != */ ]] ||
+          bad "rw needs a path inside a protected name, e.g. .claude/projects (no '.', '..' or '//')"
+        rw_paths+=("$p")
+        rw_lines+=("$n")
+        if [[ $value == *"{work}"* ]]; then rw_auto+=(1); else rw_auto+=(""); fi
         ;;
       path)
         p=$(expand_tilde "$value")
@@ -355,6 +373,28 @@ load_config() {
         ;;
     esac
   done <"$conf"
+
+  # rw holes, in config order, after every protect mount so they land on
+  # top of it. Only inside a protected name: a protect mount point can't be
+  # renamed or swapped from inside, so the hole's location can't move.
+  local i target
+  for i in "${!rw_paths[@]}"; do
+    p=${rw_paths[i]} n=${rw_lines[i]}
+    [[ -n ${protected[${p%%/*}]:-} ]] || bad "rw ~/$p isn't inside a protected name, add 'protect ${p%%/*}'"
+    # With -u or -t the whole home is writable anyway
+    [[ -z $update && -z $tmp_home ]] || continue
+    target=$sandbox_home/$p
+    if [[ ! -e $target && ! -L $target ]]; then
+      # A per-project dir appears on first use; anything else must exist,
+      # since foam can't know whether it should be a file or a dir
+      [[ -n ${rw_auto[i]} ]] || bad "rw ~/$p doesn't exist yet, create it once with -u"
+      [[ $(realpath -m -- "$target") == "$target" ]] || bad "rw ~/$p goes through a symlink, check and remove it"
+      mkdir -p -- "$target"
+    fi
+    # A symlink anywhere on the way would make bwrap mount what it points to
+    [[ $(realpath -q -- "$target" || true) == "$target" ]] || bad "rw ~/$p goes through a symlink, check and remove it"
+    args+=(--bind "$target" "$home/$p")
+  done
 
   if ((${#extra_path[@]})); then
     sandbox_path=$(IFS=:; echo "${extra_path[*]}"):$sandbox_path
