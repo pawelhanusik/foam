@@ -36,6 +36,9 @@
 #   audit yes|no    after each run, report all changes: files (also
 #                   git-ignored ones and the profile home), commits, refs
 #                   (default yes)
+#   gpu yes|no      NVIDIA GPU for CUDA: /dev/nvidiactl, /dev/nvidia-uvm
+#                   and /dev/nvidiaN (default no; adds the driver's large
+#                   kernel interface to what the sandbox can reach)
 #
 # Examples:
 #   foam                     shell in the current directory
@@ -53,6 +56,7 @@ dry_run=
 net=pasta         # config: net yes|no|pasta
 seccomp=1         # config: seccomp no
 audit=1           # config: audit no
+gpu=              # config: gpu yes
 
 # Interactive shell init, given to the sandbox as /run/foam.bashrc (a
 # read-only copy kept in foam's data dir).
@@ -368,6 +372,7 @@ load_config() {
         ;;
       seccomp) seccomp=$(yes_no "$value") || bad "seccomp needs yes or no" ;;
       audit) audit=$(yes_no "$value") || bad "audit needs yes or no" ;;
+      gpu) gpu=$(yes_no "$value") || bad "gpu needs yes or no" ;;
       *)
         bad "unknown directive '$key'"
         ;;
@@ -443,6 +448,24 @@ add_network() {
       args+=(--ro-bind "$data_dir/resolv.conf" "$target")
       ;;
   esac
+}
+
+# --- 8b2. GPU (config: gpu yes) ----------------------------------------------
+# CUDA talks to the NVIDIA driver through its device nodes; libcuda is in
+# /usr and /proc/driver/nvidia is part of /proc already. Left out:
+# nvidia-uvm-tools (profiling other processes' GPU work), nvidia-caps (MIG)
+# and nvidia-modeset (display). Bound on top of the minimal /dev.
+add_gpu() {
+  [[ -n $gpu ]] || return 0
+  local d
+  # Created on first use by the setuid nvidia-modprobe, which can't work
+  # in here (no_new_privs): they have to exist before the sandbox starts
+  [[ -c /dev/nvidiactl ]] || die "gpu yes: no /dev/nvidiactl; is the NVIDIA driver loaded? (check: nvidia-smi)"
+  [[ -c /dev/nvidia-uvm ]] || die "gpu yes: no /dev/nvidia-uvm; create it on the host with 'nvidia-modprobe -u -c=0' or by running any CUDA program once"
+  for d in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia[0-9]*; do
+    # Only real character devices: a symlink would make bwrap bind its target
+    if [[ -c $d && ! -L $d ]]; then args+=(--dev-bind "$d" "$d"); fi
+  done
 }
 
 # --- 8c. Seccomp (config: seccomp yes) ----------------------------------------
@@ -804,6 +827,7 @@ main() {
   add_home
   load_config                              # after add_home: may bind into it
   add_network                              # after load_config: 'net'
+  add_gpu                                  # after load_config: 'gpu'
   args+=(--setenv PATH "$sandbox_path")    # after load_config: includes 'path'
   args+=(--bind "$work" "$work" --chdir "$work")   # wins over ro binds above
   add_git_protection                       # after the work bind: covers .git

@@ -28,6 +28,7 @@ Foam works the same directly on the host and inside distrobox or toolbox contain
 - [Audit mode](#audit-mode)
 - [Network modes](#network-modes)
 - [Seccomp filter](#seccomp-filter)
+- [GPU (CUDA)](#gpu-cuda)
 - [Testing that it works](#testing-that-it-works)
 - [Limitations](#limitations)
 - [Files and directories](#files-and-directories)
@@ -128,7 +129,7 @@ foam builds the sandbox as an **allowlist**: the sandbox starts with an empty fi
 | Other profiles' homes and foam's configs | Not mounted, and foam refuses configs or working dirs that would expose them. |
 | Host services: systemd, D-Bus, podman/docker, ssh-agent, gpg-agent, Wayland, PipeWire, X11 socket files, tmux | Host `/run` and `/tmp` aren't mounted, and foam refuses working dirs or `ro` paths that contain sockets. |
 | Seeing or signalling other processes | Separate PID namespace. Inside, `ps` shows only the sandbox's own processes. |
-| Devices: GPU, webcam, microphone, keyboards, disks, `/dev/kvm` | Minimal private `/dev` with only `null`, `zero`, `random`, `tty` and the like. |
+| Devices: GPU, webcam, microphone, keyboards, disks, `/dev/kvm` | Minimal private `/dev` with only `null`, `zero`, `random`, `tty` and the like. A profile can add the NVIDIA GPU with `gpu yes`; see [GPU (CUDA)](#gpu-cuda). |
 | Gaining privileges: `sudo`, `su`, `pkexec`, setuid programs | The `no_new_privs` flag is set and all capabilities are dropped. |
 | Creating new user namespaces | `--disable-userns` (bwrap 0.8+) and the seccomp filter. |
 | Typing commands into your real terminal (`TIOCSTI`) | Blocked by the kernel (6.2+ when `legacy_tiocsti` is `0`), by the seccomp filter, or by a new session as a fallback. |
@@ -235,6 +236,7 @@ Configs are **parsed, never executed**: no shell code runs from them, and a typo
 | `net yes\|no\|pasta` | Network mode; see [Network modes](#network-modes). Default `pasta`. |
 | `seccomp yes\|no` | Syscall filter; see [Seccomp filter](#seccomp-filter). Default `yes`. |
 | `audit yes\|no` | Report all changes after each run; see [Audit mode](#audit-mode). Default `yes`. |
+| `gpu yes\|no` | NVIDIA GPU access for CUDA; see [GPU (CUDA)](#gpu-cuda). Default `no`. |
 
 A profile without a config file gets the defaults: own network through pasta, the seccomp filter and audit mode. Example profiles:
 
@@ -270,6 +272,12 @@ rw .claude/projects/{work}    # sessions and memory of this project only
 ```
 
 Create every `rw` path once with a `-u` run first. Settings, skills and plugins are then changed with `-u` runs only.
+
+```
+# ~/.config/foam/cuda.conf - CUDA, e.g. PyTorch (gives the sandbox the
+# NVIDIA driver's kernel interface, see GPU (CUDA))
+gpu yes
+```
 
 ```
 # ~/.config/foam/offline.conf - tests that need no network at all
@@ -394,6 +402,24 @@ Side effects:
 - **Tools that need the kernel keyring fail inside,** e.g. `kinit`. That's intended.
 - **Some programs quietly use a fallback:** Node.js drops io_uring and glibc drops `clone3`.
 - **Job control works on every kernel,** because the filter blocks `TIOCSTI` itself, so foam doesn't need its new-session fallback.
+
+---
+
+## GPU (CUDA)
+
+`gpu yes` in a profile gives the sandbox the NVIDIA devices CUDA needs. It's off by default.
+
+| Added | Left out |
+|---|---|
+| `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia0`, `/dev/nvidia1`, ... | `/dev/nvidia-uvm-tools` (profiling other processes' GPU work), `/dev/nvidia-caps` (MIG), `/dev/nvidia-modeset` and `/dev/dri` (display, OpenGL, Vulkan) |
+
+- **`/dev/nvidia-uvm` must exist before foam starts.** The driver creates it on first use through the setuid `nvidia-modprobe`, which can't work inside the sandbox. If it's missing, foam stops and tells you. Create it on the host once per boot with `nvidia-modprobe -u -c=0`, or by running any CUDA program.
+- **The CUDA toolkit (`nvcc`) isn't in `/usr` on most systems.** Add it with `ro /usr/local/cuda` and `path /usr/local/cuda/bin`. Alternatively, run foam inside a distrobox that has it. Python wheels like PyTorch bring their own CUDA runtime and need only the driver.
+- **`/sys` isn't mounted.** Plain CUDA works without it. `nvidia-smi` and some frameworks may warn about missing PCI or NUMA information.
+
+What it costs:
+- **The sandbox can reach the NVIDIA driver's large kernel interface,** which has had security bugs. This goes against foam's rule of blocking rarely needed kernel interfaces, so turn it on only in profiles that need it.
+- **GPU memory isn't always cleared between processes.** A sandbox may be able to read leftovers of other programs' GPU work, such as your browser or desktop.
 
 ---
 
@@ -572,6 +598,20 @@ Expect a report listing:
 - the commit `sandbox commit` and the moved branch
 - `node_modules` among the changed files, even though git ignores it and the file's date was faked to 2001
 - a **WARNING** about the new nested `.git` in `sub`.
+
+### 11. GPU (only with an NVIDIA GPU)
+
+```bash
+printf 'gpu yes\n' > ~/.config/foam/t-gpu.conf
+foam ls /dev | grep nvidia                    # expect: nothing (gpu no, the default)
+foam -p t-gpu ls /dev | grep nvidia           # expect: nvidia0 ..., nvidia-uvm, nvidiactl
+foam -p t-gpu ls /dev | grep -c 'uvm-tools\|modeset\|caps'   # expect: 0
+foam -p t-gpu nvidia-smi -L                   # expect: your GPU(s)
+foam -p t-gpu python3 -c 'import ctypes; c = ctypes.CDLL("libcuda.so.1"); print(c.cuInit(0))'
+                                              # expect: 0 (CUDA works)
+```
+
+If `cuInit` returns non-zero with `gpu yes`, compare with `seccomp no` in the same profile before looking elsewhere.
 
 ### Cleanup
 
